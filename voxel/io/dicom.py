@@ -15,6 +15,7 @@ import itertools
 import multiprocessing as mp
 import os
 import re
+import warnings
 from math import ceil, log10
 from typing import Any, Collection, Dict, List, Sequence, Tuple, Union
 
@@ -111,6 +112,11 @@ class DicomReader(DataReader):
         default_ornt (Tuple[str, str], optional): Default in-plane orientation to use if
             orientation cannot be determined from DICOM header. If not specified
             and orientation cannot be determined, error will be raised.
+        duplicates (str, optional): How to handle duplicate slices (slices in the same
+            group sharing the same ``ImagePositionPatient``). One of ``"warn"`` or
+            ``"remove"``.
+        duplicates_tol (float, optional): Absolute tolerance (in mm) used when comparing
+            ``ImagePositionPatient`` to detect duplicate slices.
         data_format_code (ImageDataFormat): The supported image data format.
 
     Examples:
@@ -138,6 +144,8 @@ class DicomReader(DataReader):
         ignore_ext: bool = False,
         default_ornt: Tuple[str, str] = None,
         group_by_tol: float = 1e-5,
+        duplicates: str = "warn",
+        duplicates_tol: float = 1e-3,
     ):
         """
         Args:
@@ -157,7 +165,14 @@ class DicomReader(DataReader):
             group_by_tol (float, optional): Absolute tolerance used when comparing
                 floating point ``group_by`` values (e.g. ImageOrientationPatient).
                 Non-float values are compared exactly.
+            duplicates (str, optional): How to handle duplicate slices, i.e. slices within
+                the same group that share the same ``ImagePositionPatient`` (compared with
+                tolerance ``duplicates_tol``). ``"warn"`` issues a warning and keeps all slices,
+                ``"remove"`` keeps only the first occurrence and warns about removed slices.
+            duplicates_tol (float, optional): Absolute tolerance (in mm) used when comparing
+                ``ImagePositionPatient`` to detect duplicate slices.
         """
+        _check_duplicates_option(duplicates)
         self.num_workers = num_workers
         self.verbose = verbose
         self.group_by = group_by
@@ -165,6 +180,8 @@ class DicomReader(DataReader):
         self.ignore_ext = ignore_ext
         self.default_ornt = default_ornt
         self.group_by_tol = group_by_tol
+        self.duplicates = duplicates
+        self.duplicates_tol = duplicates_tol
 
     def get_files(
         self,
@@ -265,6 +282,8 @@ class DicomReader(DataReader):
         ignore_ext: bool = np._NoValue,
         default_ornt: Tuple[str, str] = np._NoValue,
         group_by_tol: float = np._NoValue,
+        duplicates: str = np._NoValue,
+        duplicates_tol: float = np._NoValue,
     ):
         """Load dicoms into ``MedicalVolume``s grouped by ``group_by`` tag(s).
 
@@ -291,6 +310,13 @@ class DicomReader(DataReader):
             group_by_tol (float, optional): Absolute tolerance used when comparing
                 floating point ``group_by`` values (e.g. ImageOrientationPatient).
                 Non-float values are compared exactly. Defaults to ``self.group_by_tol``.
+            duplicates (str, optional): How to handle duplicate slices, i.e. slices within
+                the same group that share the same ``ImagePositionPatient``. ``"warn"``
+                issues a warning and keeps all slices, ``"remove"`` keeps only the first
+                occurrence. Defaults to ``self.duplicates``.
+            duplicates_tol (float, optional): Absolute tolerance (in mm) used when comparing
+                ``ImagePositionPatient`` to detect duplicate slices.
+                Defaults to ``self.duplicates_tol``.
 
         Returns:
             Union[List[MedicalVolume], MedicalVolume]: Different volumes grouped by the
@@ -311,6 +337,9 @@ class DicomReader(DataReader):
         ignore_ext = ignore_ext if ignore_ext != np._NoValue else self.ignore_ext
         default_ornt = default_ornt if default_ornt != np._NoValue else self.default_ornt
         group_by_tol = group_by_tol if group_by_tol != np._NoValue else self.group_by_tol
+        duplicates = duplicates if duplicates != np._NoValue else self.duplicates
+        duplicates_tol = duplicates_tol if duplicates_tol != np._NoValue else self.duplicates_tol
+        _check_duplicates_option(duplicates)
 
         group_by = _wrap_as_tuple(group_by, default=())
         sort_by = _wrap_as_tuple(sort_by, default=())
@@ -396,11 +425,13 @@ class DicomReader(DataReader):
         vols = []
         for k in sorted(dicom_data.keys()):
             dd = dicom_data[k]
-            headers = dd["headers"]
+            headers, arrs = _handle_duplicate_slices(
+                dd["headers"], dd["arr"], duplicates, duplicates_tol, group=k if group_by else None
+            )
             if len(headers) == 0:
                 continue
             _harmonize_group_attrs(headers, group_by)
-            arr = np.stack(dd["arr"], axis=-1)
+            arr = np.stack(arrs, axis=-1)
 
             affine = stdo.to_RAS_affine(headers, default_ornt=default_ornt)
 
@@ -730,6 +761,96 @@ def _harmonize_group_attrs(headers, group_by):
         for h in headers[1:]:
             if h[attr].value != ref:
                 h[attr].value = copy.deepcopy(ref)
+
+
+_DUPLICATES_OPTIONS = ("warn", "remove")
+
+
+def _check_duplicates_option(duplicates):
+    if duplicates not in _DUPLICATES_OPTIONS:
+        raise ValueError(f"`duplicates` must be one of {_DUPLICATES_OPTIONS}, got {duplicates!r}")
+
+
+def _handle_duplicate_slices(headers, arrs, duplicates, tol, group=None):
+    """Detect slices sharing the same position along the slice normal.
+
+    The slice normal is computed from ImageOrientationPatient, and
+    ImagePositionPatient is projected onto this normal to obtain a
+    scalar slice coordinate.
+
+    Slices without ImagePositionPatient or ImageOrientationPatient
+    are never considered duplicates.
+
+    Args:
+        headers: List of DICOM headers.
+        arrs: List of corresponding pixel arrays.
+        duplicates: How to handle duplicates ("warn" or "remove").
+        tol: Absolute tolerance for comparing slice coordinates.
+        group: Optional group identifier for warning messages.
+
+    Returns:
+        Tuple[List, List]: The (possibly filtered) headers and arrays.
+    """
+    unique_positions = []
+    keep = []
+    duplicate_idxs = []
+
+    for i, h in enumerate(headers):
+        ipp = _unpack_dicom_attr(h, "ImagePositionPatient")
+        iop = _unpack_dicom_attr(h, "ImageOrientationPatient")
+
+        if ipp is None or iop is None:
+            keep.append(i)
+            continue
+
+        ipp = np.asarray(ipp, dtype=float)
+        iop = np.asarray(iop, dtype=float)
+
+        row = iop[:3]
+        col = iop[3:]
+
+        normal = np.cross(row, col)
+        norm = np.linalg.norm(normal)
+
+        if norm < 1e-8:
+            keep.append(i)
+            continue
+
+        normal /= norm
+
+        position = float(np.dot(ipp, normal))
+
+        if any(
+            np.isclose(position, p, atol=tol, rtol=0)
+            for p in unique_positions
+        ):
+            duplicate_idxs.append(i)
+
+            if duplicates == "warn":
+                keep.append(i)
+        else:
+            unique_positions.append(position)
+            keep.append(i)
+
+    if duplicate_idxs:
+        group_str = f" in group {group}" if group is not None else ""
+        action = "Removing" if duplicates == "remove" else "Found"
+
+        msg = (
+            f"{action} {len(duplicate_idxs)} possible duplicate slice(s)"
+            f"{group_str} (same position along the slice normal "
+            f"as an earlier slice)."
+        )
+
+        if duplicates == "warn":
+            msg += (
+                " Consider specifying `group_by` or using "
+                "`duplicates='remove'` to keep only the first occurrence."
+            )
+
+        warnings.warn(msg, UserWarning, stacklevel=3)
+
+    return [headers[i] for i in keep], [arrs[i] for i in keep]
 
 
 def _unpack_dicom_attr(header, attr, required=False):
